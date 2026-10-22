@@ -108,4 +108,4 @@ Accompanying paper: *IAMWatch: Event-Driven, Graph-Based Detection of Multi-Step
 
 ## License
 
-[Add a license, e.g. MIT, or state "All rights reserved" until the paper is published.]
+All rights reserved
