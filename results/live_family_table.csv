@@ -1,0 +1,10 @@
+family,attacks,iamwatch_detected,rules_detected,guardduty_any,guardduty_origin
+s1,30,30,30,,
+s2,30,30,30,,
+s3,30,30,30,,
+s4,30,30,30,,
+s5,30,30,30,,
+x1,30,30,0,,
+x2,30,30,0,,
+x3,30,30,0,,
+x4,30,30,0,,

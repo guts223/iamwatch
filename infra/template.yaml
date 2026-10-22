@@ -1,0 +1,445 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  iamwatch - event-driven detection of multi-step IAM privilege escalation.
+  CloudTrail -> EventBridge (us-east-1) -> SQS FIFO -> Lambda -> S3 state, DynamoDB, SNS.
+
+Parameters:
+  CodeBucket:
+    Type: String
+    Description: S3 bucket holding the Lambda zip (created by scripts/deploy.py)
+  CodeKey:
+    Type: String
+    Description: S3 key of the Lambda zip
+  AlertEmail:
+    Type: String
+    Description: E-mail address that receives ACTIVE / EVASION alerts (you must confirm the SNS subscription)
+  Allowlist:
+    Type: String
+    Default: ""
+    Description: Comma-separated principal names or ARNs that never raise alerts (e.g. your Terraform role)
+  MaxHops:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 8
+    Description: k, the maximum number of hops searched
+  WindowSeconds:
+    Type: Number
+    Default: 3600
+    Description: Evidence window - all steps of a path must happen within this many seconds
+  LinkedWindowSeconds:
+    Type: Number
+    Default: 43200
+    Description: Longer window for steps that use a credential issued by an earlier step of the same chain (0 = same as WindowSeconds)
+  GapfillMinutes:
+    Type: Number
+    Default: 60
+    Description: How far back the 5-minute gap-fill job looks in the CloudTrail event history for events that never reached the queue
+  CooldownSeconds:
+    Type: Number
+    Default: 3600
+    Description: Suppress repeats of the same alert (same path + level) for this long. Use 60 for repeated experiment runs.
+  NotifyWatch:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Also e-mail WATCH (partial evidence) alerts
+
+Resources:
+  StateBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  TrailBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-trail-logs
+            Status: Enabled
+            ExpirationInDays: 30
+
+  TrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TrailBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: CloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt TrailBucket.Arn
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub "arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${AWS::StackName}-trail"
+          - Sid: CloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${TrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*"
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                aws:SourceArn: !Sub "arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${AWS::StackName}-trail"
+
+  Trail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: TrailBucketPolicy
+    Properties:
+      TrailName: !Sub "${AWS::StackName}-trail"
+      S3BucketName: !Ref TrailBucket
+      IsLogging: true
+      IsMultiRegionTrail: false
+      IncludeGlobalServiceEvents: true
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+
+  EventsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: eventID
+          AttributeType: S
+      KeySchema:
+        - AttributeName: eventID
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  AlertsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: alertId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: alertId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      FifoQueue: true
+      MessageRetentionPeriod: 1209600
+
+  EventQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      VisibilityTimeout: 720
+      MessageRetentionPeriod: 86400
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 5
+
+  EventQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref EventQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowEventBridge
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt EventQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt IamEventRule.Arn
+
+  EngineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-engine"
+      RetentionInDays: 14
+
+  EngineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: iamwatch-engine
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${EngineLogGroup.Arn}:*"
+              - Sid: Queue
+                Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:ChangeMessageVisibility
+                  - sqs:SendMessage
+                Resource: !GetAtt EventQueue.Arn
+              - Sid: GapFill
+                Effect: Allow
+                Action:
+                  - cloudtrail:LookupEvents
+                Resource: "*"
+              - Sid: EventsRead
+                Effect: Allow
+                Action:
+                  - dynamodb:BatchGetItem
+                Resource: !GetAtt EventsTable.Arn
+              - Sid: State
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub "${StateBucket.Arn}/*"
+              - Sid: StateHead
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt StateBucket.Arn
+              - Sid: Tables
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt EventsTable.Arn
+                  - !GetAtt AlertsTable.Arn
+              - Sid: Notify
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+              - Sid: ReadIam
+                Effect: Allow
+                Action:
+                  - iam:GetAccountAuthorizationDetails
+                  - iam:GetPolicy
+                  - iam:GetPolicyVersion
+                  - iam:ListPolicyVersions
+                Resource: "*"
+
+  EngineFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: EngineLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-engine"
+      Runtime: python3.12
+      Handler: handler.handler
+      Role: !GetAtt EngineRole.Arn
+      Timeout: 120
+      MemorySize: 512
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Ref CodeKey
+      Environment:
+        Variables:
+          STATE_BUCKET: !Ref StateBucket
+          STATE_KEY: state/engine.json
+          EVENTS_TABLE: !Ref EventsTable
+          ALERTS_TABLE: !Ref AlertsTable
+          TOPIC_ARN: !Ref AlertTopic
+          MAX_HOPS: !Ref MaxHops
+          WINDOW_SECONDS: !Ref WindowSeconds
+          LINKED_WINDOW_SECONDS: !Ref LinkedWindowSeconds
+          QUEUE_URL: !Ref EventQueue
+          COOLDOWN_SECONDS: !Ref CooldownSeconds
+          ALLOWLIST: !Ref Allowlist
+          NOTIFY_WATCH: !Ref NotifyWatch
+
+  EngineEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt EventQueue.Arn
+      FunctionName: !Ref EngineFunction
+      BatchSize: 10
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+  IamEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Forward IAM / STS / PassRole-related CloudTrail management events to iamwatch
+      State: ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS
+      EventPattern:
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+          - iam.amazonaws.com
+          - sts.amazonaws.com
+          - lambda.amazonaws.com
+          - ec2.amazonaws.com
+          - cloudformation.amazonaws.com
+          - cloudtrail.amazonaws.com
+          - events.amazonaws.com
+          eventName:
+          - AddRoleToInstanceProfile
+          - AddUserToGroup
+          - AssumeRole
+          - AttachGroupPolicy
+          - AttachRolePolicy
+          - AttachUserPolicy
+          - CreateAccessKey
+          - CreateFunction20150331
+          - CreateGroup
+          - CreateInstanceProfile
+          - CreateLoginProfile
+          - CreatePolicy
+          - CreatePolicyVersion
+          - CreateRole
+          - CreateStack
+          - CreateUser
+          - DeleteGroup
+          - DeleteGroupPolicy
+          - DeleteInstanceProfile
+          - DeletePolicy
+          - DeletePolicyVersion
+          - DeleteRole
+          - DeleteRolePermissionsBoundary
+          - DeleteRolePolicy
+          - DeleteRule
+          - DeleteTrail
+          - DeleteUser
+          - DeleteUserPermissionsBoundary
+          - DeleteUserPolicy
+          - DetachGroupPolicy
+          - DetachRolePolicy
+          - DetachUserPolicy
+          - DisableRule
+          - PutEventSelectors
+          - PutGroupPolicy
+          - PutRolePermissionsBoundary
+          - PutRolePolicy
+          - PutUserPermissionsBoundary
+          - PutUserPolicy
+          - RemoveRoleFromInstanceProfile
+          - RemoveTargets
+          - RemoveUserFromGroup
+          - RunInstances
+          - SetDefaultPolicyVersion
+          - StopLogging
+          - UpdateAssumeRolePolicy
+          - UpdateLoginProfile
+          - UpdateTrail
+      Targets:
+        - Id: iamwatch-queue
+          Arn: !GetAtt EventQueue.Arn
+          SqsParameters:
+            MessageGroupId: iamwatch
+
+  ReconcileRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Periodic full IAM snapshot -> drift report
+      ScheduleExpression: rate(6 hours)
+      State: ENABLED
+      Targets:
+        - Id: reconcile
+          Arn: !GetAtt EngineFunction.Arn
+          Input: '{"action": "reconcile"}'
+
+  ReconcilePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref EngineFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ReconcileRule.Arn
+
+  GapfillRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Every 5 minutes re-read the CloudTrail event history and queue events that never arrived
+      ScheduleExpression: rate(5 minutes)
+      State: ENABLED
+      Targets:
+        - Id: gapfill
+          Arn: !GetAtt EngineFunction.Arn
+          Input: !Sub '{"action": "gapfill", "lookback_minutes": ${GapfillMinutes}, "min_age_seconds": 90}'
+
+  GapfillPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref EngineFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt GapfillRule.Arn
+
+Outputs:
+  StateBucketName:
+    Value: !Ref StateBucket
+  TrailBucketName:
+    Value: !Ref TrailBucket
+  EventsTableName:
+    Value: !Ref EventsTable
+  AlertsTableName:
+    Value: !Ref AlertsTable
+  QueueUrl:
+    Value: !Ref EventQueue
+  DeadLetterQueueUrl:
+    Value: !Ref DeadLetterQueue
+  FunctionName:
+    Value: !Ref EngineFunction
+  TopicArn:
+    Value: !Ref AlertTopic
+  IamEventRuleName:
+    Value: !Ref IamEventRule
+  GapfillRuleName:
+    Value: !Ref GapfillRule

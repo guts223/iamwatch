@@ -1,0 +1,16 @@
+# NEVER commit credentials
+lab/lab_credentials.json
+.env
+*.pem
+# build output and local data
+build/
+data/*.json
+__pycache__/
+.pytest_cache/
+*.pyc
+.venv/
+results/export/
+results_run1_INVALID/
+*.zip
+.aws/
+credentials

@@ -1,0 +1,15 @@
+{
+ "operations": 213,
+ "operations_failed": 0,
+ "minutes": 60.1,
+ "events_seen": 454,
+ "iamwatch_active": 0,
+ "iamwatch_watch": 42,
+ "iamwatch_evasion": 0,
+ "active_alerts": [],
+ "stateless_rule_hits": 63,
+ "stateless_by_rule": {
+  "R5": 32,
+  "R4": 31
+ }
+}

@@ -1,0 +1,2 @@
+# needed to run the scripts (deploy, lab, replay, experiments)
+boto3>=1.34
