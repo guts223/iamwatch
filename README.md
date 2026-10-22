@@ -6,7 +6,7 @@ Attackers rarely jump straight to admin. They climb: assume a role, then another
 
 IAMWatch keeps a live map of "who can become whom, and who can reach ADMIN", and checks every IAM action against that map as it happens. When an identity completes a route to admin, it raises an alert that names **who** did it and **the exact path** they took.
 
-## Results at a glance
+## Results at a glance 
 
 Tested on a real AWS account with **270 scripted attacks** (9 families × 30 runs) plus one hour of normal activity.
 
